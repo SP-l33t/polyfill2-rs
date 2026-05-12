@@ -594,8 +594,25 @@ impl Default for ExtraOrderArgsV1 {
 pub struct MarketOrderArgs {
     pub token_id: String,
     pub side: Side,
-    /// Quote amount for buys, base token amount for sells.
+    /// Quote amount (USDC) for BUY, base token amount for SELL.
     pub amount: Decimal,
+    /// Worst-price limit baked into the EIP-712 maker/taker ratio for slippage
+    /// protection. `None` falls back to a book-walk to derive the price.
+    pub price: Option<Decimal>,
+    /// Execution semantics. Drives the FAK book-walk fallback. Defaults to `FOK`.
+    pub order_type: OrderType,
+}
+
+impl Default for MarketOrderArgs {
+    fn default() -> Self {
+        Self {
+            token_id: String::new(),
+            side: Side::BUY,
+            amount: Decimal::ZERO,
+            price: None,
+            order_type: OrderType::FOK,
+        }
+    }
 }
 
 /// Signed order request ready for submission (V2).

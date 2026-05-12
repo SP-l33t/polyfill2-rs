@@ -7,8 +7,8 @@ use crate::auth::sign_order_message;
 use crate::client::OrderArgs;
 use crate::errors::{PolyfillError, Result};
 use crate::types::{
-    ExtraOrderArgs, ExtraOrderArgsV1, MarketOrderArgs, OrderOptions, RfqOrderExecutionRequest,
-    Side, SignedOrderRequest,
+    ExtraOrderArgs, ExtraOrderArgsV1, MarketOrderArgs, OrderOptions, OrderType,
+    RfqOrderExecutionRequest, Side, SignedOrderRequest,
 };
 use alloy_primitives::{Address, U256};
 use alloy_signer_local::PrivateKeySigner;
@@ -239,7 +239,8 @@ impl OrderBuilder {
         price: Decimal,
         round_config: &RoundConfig,
     ) -> (u32, u32) {
-        let raw_price = price.round_dp_with_strategy(round_config.price, MidpointTowardZero);
+        // V2 market-order price rounds down; limit orders still round-half.
+        let raw_price = price.round_dp_with_strategy(round_config.price, ToZero);
         match side {
             Side::BUY => {
                 let raw_maker_amt = amount.round_dp_with_strategy(round_config.size, ToZero);
@@ -262,32 +263,44 @@ impl OrderBuilder {
         }
     }
 
-    /// Calculate market price from order book levels
+    /// Walk `positions` (best-first) summing liquidity until `amount_to_match`
+    /// is covered, returning the price of the level that filled the requirement.
+    /// `OrderType::FAK` returns the worst visible price on exhaustion; other
+    /// types error.
     pub fn calculate_market_price(
         &self,
         side: Side,
         positions: &[crate::types::BookLevel],
         amount_to_match: Decimal,
+        order_type: OrderType,
     ) -> Result<Decimal> {
         let mut sum = Decimal::ZERO;
+        let mut last_price: Option<Decimal> = None;
 
         for level in positions {
             sum += match side {
                 Side::BUY => level.size * level.price,
                 Side::SELL => level.size,
             };
+            last_price = Some(level.price);
             if sum >= amount_to_match {
                 return Ok(level.price);
             }
         }
 
-        Err(PolyfillError::order(
-            format!(
-                "Not enough liquidity to create market order with amount {}",
-                amount_to_match
-            ),
-            crate::errors::OrderErrorKind::InsufficientBalance,
-        ))
+        // Liquidity exhausted before reaching amount_to_match.
+        // FAK accepts partial fills, so we return the worst price walked as
+        // the slippage ceiling; FOK and other strict types still error.
+        match (order_type, last_price) {
+            (OrderType::FAK, Some(p)) => Ok(p),
+            _ => Err(PolyfillError::order(
+                format!(
+                    "Not enough liquidity to create market order with amount {}",
+                    amount_to_match
+                ),
+                crate::errors::OrderErrorKind::InsufficientBalance,
+            )),
+        }
     }
 
     /// Create a market order
@@ -649,13 +662,23 @@ mod tests {
 
         // BUY amounts are quote-denominated: need 6 USDC -> first level (10 * 0.50 = 5) is not enough.
         let buy_price = builder
-            .calculate_market_price(Side::BUY, &levels, Decimal::from_str("6").unwrap())
+            .calculate_market_price(
+                Side::BUY,
+                &levels,
+                Decimal::from_str("6").unwrap(),
+                OrderType::FOK,
+            )
             .unwrap();
         assert_eq!(buy_price, Decimal::from_str("0.55").unwrap());
 
         // SELL amounts are base-denominated: need 6 tokens -> first level (size 10) is enough.
         let sell_price = builder
-            .calculate_market_price(Side::SELL, &levels, Decimal::from_str("6").unwrap())
+            .calculate_market_price(
+                Side::SELL,
+                &levels,
+                Decimal::from_str("6").unwrap(),
+                OrderType::FOK,
+            )
             .unwrap();
         assert_eq!(sell_price, Decimal::from_str("0.50").unwrap());
     }
@@ -675,6 +698,7 @@ mod tests {
                     token_id: "123".to_string(),
                     side: Side::SELL,
                     amount: Decimal::from_str("5").unwrap(),
+                    ..Default::default()
                 },
                 Decimal::from_str("0.40").unwrap(),
                 &ExtraOrderArgs::default(),
@@ -687,5 +711,203 @@ mod tests {
             .unwrap();
 
         assert_eq!(order.side, "SELL");
+    }
+
+    #[test]
+    fn test_market_order_buy_bakes_price_into_taker_amount() {
+        let signer: PrivateKeySigner =
+            "0x1234567890123456789012345678901234567890123456789012345678901234"
+                .parse()
+                .unwrap();
+        let builder = OrderBuilder::new(signer, None, None);
+
+        let order = builder
+            .create_market_order(
+                137,
+                &MarketOrderArgs {
+                    token_id: "1".to_string(),
+                    side: Side::BUY,
+                    amount: Decimal::from_str("100").unwrap(),
+                    ..Default::default()
+                },
+                Decimal::from_str("0.50").unwrap(),
+                &ExtraOrderArgs::default(),
+                &OrderOptions {
+                    tick_size: Some(Decimal::from_str("0.01").unwrap()),
+                    neg_risk: Some(false),
+                    fee_rate_bps: None,
+                },
+            )
+            .unwrap();
+
+        // BUY: maker_amount = amount (USDC); taker_amount = amount / price
+        // 100 USDC / 0.50 = 200 shares; scaled by 1e6: 100_000_000 and 200_000_000.
+        assert_eq!(order.side, "BUY");
+        assert_eq!(order.maker_amount, "100000000");
+        assert_eq!(order.taker_amount, "200000000");
+    }
+
+    #[test]
+    fn test_market_order_sell_bakes_price_into_taker_amount() {
+        let signer: PrivateKeySigner =
+            "0x1234567890123456789012345678901234567890123456789012345678901234"
+                .parse()
+                .unwrap();
+        let builder = OrderBuilder::new(signer, None, None);
+
+        let order = builder
+            .create_market_order(
+                137,
+                &MarketOrderArgs {
+                    token_id: "1".to_string(),
+                    side: Side::SELL,
+                    amount: Decimal::from_str("200").unwrap(),
+                    ..Default::default()
+                },
+                Decimal::from_str("0.50").unwrap(),
+                &ExtraOrderArgs::default(),
+                &OrderOptions {
+                    tick_size: Some(Decimal::from_str("0.01").unwrap()),
+                    neg_risk: Some(false),
+                    fee_rate_bps: None,
+                },
+            )
+            .unwrap();
+
+        // SELL: maker_amount = amount (shares); taker_amount = amount * price
+        // 200 shares * 0.50 = 100 USDC; scaled by 1e6: 200_000_000 and 100_000_000.
+        assert_eq!(order.side, "SELL");
+        assert_eq!(order.maker_amount, "200000000");
+        assert_eq!(order.taker_amount, "100000000");
+    }
+
+    #[test]
+    fn test_market_order_v2_price_rounds_down() {
+        // Regression guard: market-order price must round DOWN. Tick 0.01,
+        // price 0.6789 -> raw_price 0.67 -> taker = 100/0.67 = 149.2537.
+        let signer: PrivateKeySigner =
+            "0x1234567890123456789012345678901234567890123456789012345678901234"
+                .parse()
+                .unwrap();
+        let builder = OrderBuilder::new(signer, None, None);
+
+        let order = builder
+            .create_market_order(
+                137,
+                &MarketOrderArgs {
+                    token_id: "1".to_string(),
+                    side: Side::BUY,
+                    amount: Decimal::from_str("100").unwrap(),
+                    ..Default::default()
+                },
+                Decimal::from_str("0.6789").unwrap(),
+                &ExtraOrderArgs::default(),
+                &OrderOptions {
+                    tick_size: Some(Decimal::from_str("0.01").unwrap()),
+                    neg_risk: Some(false),
+                    fee_rate_bps: None,
+                },
+            )
+            .unwrap();
+
+        // 100 USDC / 0.67 = 149.2537 -> 149_253_700 (scaled 1e6).
+        // With round-half rounding, price would be 0.68 -> 147_058_800.
+        assert_eq!(order.maker_amount, "100000000");
+        assert_eq!(order.taker_amount, "149253700");
+    }
+
+    #[test]
+    fn test_calculate_market_price_fak_returns_worst_walked_on_exhaustion() {
+        let signer: PrivateKeySigner =
+            "0x1234567890123456789012345678901234567890123456789012345678901234"
+                .parse()
+                .unwrap();
+        let builder = OrderBuilder::new(signer, None, None);
+
+        let levels = vec![
+            crate::types::BookLevel {
+                price: Decimal::from_str("0.50").unwrap(),
+                size: Decimal::from_str("5").unwrap(),
+            },
+            crate::types::BookLevel {
+                price: Decimal::from_str("0.60").unwrap(),
+                size: Decimal::from_str("5").unwrap(),
+            },
+        ];
+
+        // BUY needs $100 USDC; total quote = 5*0.50 + 5*0.60 = 5.50 - short.
+        // FAK should return the worst (last-walked) price = 0.60 as ceiling.
+        let price = builder
+            .calculate_market_price(
+                Side::BUY,
+                &levels,
+                Decimal::from_str("100").unwrap(),
+                OrderType::FAK,
+            )
+            .unwrap();
+        assert_eq!(price, Decimal::from_str("0.60").unwrap());
+    }
+
+    #[test]
+    fn test_calculate_market_price_fok_errors_on_exhaustion() {
+        let signer: PrivateKeySigner =
+            "0x1234567890123456789012345678901234567890123456789012345678901234"
+                .parse()
+                .unwrap();
+        let builder = OrderBuilder::new(signer, None, None);
+
+        let levels = vec![crate::types::BookLevel {
+            price: Decimal::from_str("0.50").unwrap(),
+            size: Decimal::from_str("5").unwrap(),
+        }];
+
+        let err = builder
+            .calculate_market_price(
+                Side::BUY,
+                &levels,
+                Decimal::from_str("100").unwrap(),
+                OrderType::FOK,
+            )
+            .unwrap_err();
+
+        // Must be an InsufficientBalance order error.
+        assert!(matches!(
+            err,
+            PolyfillError::Order { ref kind, .. }
+                if matches!(kind, crate::errors::OrderErrorKind::InsufficientBalance)
+        ));
+    }
+
+    #[test]
+    fn test_calculate_market_price_empty_book_errors_regardless_of_type() {
+        let signer: PrivateKeySigner =
+            "0x1234567890123456789012345678901234567890123456789012345678901234"
+                .parse()
+                .unwrap();
+        let builder = OrderBuilder::new(signer, None, None);
+
+        let empty: Vec<crate::types::BookLevel> = vec![];
+
+        // FAK + empty -> still error (no last_price to use as ceiling).
+        let err_fak = builder
+            .calculate_market_price(
+                Side::BUY,
+                &empty,
+                Decimal::from_str("100").unwrap(),
+                OrderType::FAK,
+            )
+            .unwrap_err();
+        assert!(matches!(err_fak, PolyfillError::Order { .. }));
+
+        // FOK + empty -> still error.
+        let err_fok = builder
+            .calculate_market_price(
+                Side::BUY,
+                &empty,
+                Decimal::from_str("100").unwrap(),
+                OrderType::FOK,
+            )
+            .unwrap_err();
+        assert!(matches!(err_fok, PolyfillError::Order { .. }));
     }
 }
