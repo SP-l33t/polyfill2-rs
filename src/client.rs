@@ -818,26 +818,19 @@ impl ClobClient {
         Ok(neg_risk_response.neg_risk)
     }
 
-    /// Resolve tick size for an order
+    /// Resolve tick size for an order.
+    ///
+    /// If the caller supplied a tick, trust it and skip the REST round-trip; the server
+    /// will reject a malformed tick at order submission time. Only fetch from `/tick-size`
+    /// when the caller didn't supply one. Mirrors the `neg_risk` resolution pattern below.
     async fn resolve_tick_size(
         &self,
         token_id: &str,
         tick_size: Option<Decimal>,
     ) -> Result<Decimal> {
-        let min_tick_size = self.get_tick_size(token_id).await?;
-
         match tick_size {
-            None => Ok(min_tick_size),
-            Some(t) => {
-                if t < min_tick_size {
-                    Err(PolyfillError::validation(format!(
-                        "Tick size {} is smaller than min_tick_size {} for token_id: {}",
-                        t, min_tick_size, token_id
-                    )))
-                } else {
-                    Ok(t)
-                }
-            },
+            Some(t) => Ok(t),
+            None => self.get_tick_size(token_id).await,
         }
     }
 
@@ -2961,11 +2954,10 @@ mod tests {
     async fn test_create_market_order_uses_caller_supplied_price_skips_book() {
         let mut server = mockito::Server::new_async().await;
 
-        // resolve_tick_size still calls /tick-size to validate the caller's
-        // tick is >= min_tick_size, even when options.tick_size is Some.
-        let _tick_mock = server
+        // /tick-size MUST NOT be hit when the caller supplied options.tick_size.
+        let tick_mock = server
             .mock("GET", "/tick-size")
-            .match_query(Matcher::UrlEncoded("token_id".into(), "1".into()))
+            .expect(0)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"minimum_tick_size": "0.01"}"#)
@@ -3006,7 +2998,8 @@ mod tests {
             result.err()
         );
 
-        // The /book endpoint must not have been hit.
+        // Neither /tick-size nor /book should have been hit.
+        tick_mock.assert_async().await;
         book_mock.assert_async().await;
     }
 
@@ -3014,10 +3007,10 @@ mod tests {
     async fn test_create_market_order_none_price_falls_back_to_book() {
         let mut server = mockito::Server::new_async().await;
 
-        // resolve_tick_size still calls /tick-size to validate caller's tick.
-        let _tick_mock = server
+        // /tick-size MUST NOT be hit when the caller supplied options.tick_size.
+        let tick_mock = server
             .mock("GET", "/tick-size")
-            .match_query(Matcher::UrlEncoded("token_id".into(), "1".into()))
+            .expect(0)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"minimum_tick_size": "0.01"}"#)
@@ -3060,7 +3053,8 @@ mod tests {
             result.err()
         );
 
-        // The /book endpoint must have been hit.
+        // /tick-size MUST NOT be hit (caller supplied options.tick_size); /book MUST be hit.
+        tick_mock.assert_async().await;
         book_mock.assert_async().await;
     }
 
@@ -3068,10 +3062,10 @@ mod tests {
     async fn test_create_and_post_market_order_uses_order_type_from_args() {
         let mut server = mockito::Server::new_async().await;
 
-        // resolve_tick_size still calls /tick-size to validate caller's tick.
-        let _tick_mock = server
+        // /tick-size MUST NOT be hit when the caller supplied options.tick_size.
+        let tick_mock = server
             .mock("GET", "/tick-size")
-            .match_query(Matcher::UrlEncoded("token_id".into(), "1".into()))
+            .expect(0)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"minimum_tick_size": "0.01"}"#)
@@ -3112,6 +3106,7 @@ mod tests {
             result.err()
         );
 
+        tick_mock.assert_async().await;
         order_mock.assert_async().await;
     }
 
