@@ -865,11 +865,14 @@ impl ClobClient {
         })
     }
 
-    /// Check if price is in valid range
+    /// True if `price` is within `[tick, 1 - tick]` and aligned to the tick grid.
     fn is_price_in_range(&self, price: Decimal, tick_size: Decimal) -> bool {
         let min_price = tick_size;
         let max_price = Decimal::ONE - tick_size;
-        price >= min_price && price <= max_price
+        if price < min_price || price > max_price {
+            return false;
+        }
+        price % tick_size == Decimal::ZERO
     }
 
     /// Create an order
@@ -910,12 +913,16 @@ impl ClobClient {
         )
     }
 
-    /// Calculate market price from order book
+    /// Calculate market price from order book.
+    ///
+    /// `order_type` drives the FAK book-walk fallback: FAK returns the worst
+    /// visible price on book exhaustion; other types error.
     async fn calculate_market_price(
         &self,
         token_id: &str,
         side: Side,
         amount: Decimal,
+        order_type: crate::types::OrderType,
     ) -> Result<Decimal> {
         let book = self.get_order_book(token_id).await?;
         let order_builder = self
@@ -943,10 +950,14 @@ impl ClobClient {
                 .collect(),
         };
 
-        order_builder.calculate_market_price(side, &levels, amount)
+        order_builder.calculate_market_price(side, &levels, amount, order_type)
     }
 
-    /// Create a market order
+    /// Create a market order.
+    ///
+    /// If `order_args.price` is `Some`, that price is baked into the EIP-712
+    /// maker/taker ratio as a slippage limit (no `/book` request). If `None`,
+    /// the price is derived from a live book-walk.
     pub async fn create_market_order(
         &self,
         order_args: &crate::types::MarketOrderArgs,
@@ -963,9 +974,19 @@ impl ClobClient {
             .await?;
 
         let extras = extras.unwrap_or_default();
-        let price = self
-            .calculate_market_price(&order_args.token_id, order_args.side, order_args.amount)
-            .await?;
+
+        let price = match order_args.price {
+            Some(p) => p,
+            None => {
+                self.calculate_market_price(
+                    &order_args.token_id,
+                    order_args.side,
+                    order_args.amount,
+                    order_args.order_type,
+                )
+                .await?
+            },
+        };
 
         if !self.is_price_in_range(
             price,
@@ -983,6 +1004,21 @@ impl ClobClient {
             &extras,
             &create_order_options,
         )
+    }
+
+    /// Create and post a market order, using `order_args.order_type` for both
+    /// the book-walk fallback (when `price = None`) and the matching-engine flag
+    /// at submission. This is the single-source-of-truth path for market orders.
+    pub async fn create_and_post_market_order(
+        &self,
+        order_args: &crate::types::MarketOrderArgs,
+        extras: Option<crate::types::ExtraOrderArgs>,
+        options: Option<&OrderOptions>,
+    ) -> Result<crate::types::PostOrderResponse> {
+        let signed = self
+            .create_market_order(order_args, extras, options)
+            .await?;
+        self.post_order(signed, order_args.order_type).await
     }
 
     /// Post an order to the exchange
@@ -2919,6 +2955,164 @@ mod tests {
             matches!(error, PolyfillError::Network { .. })
                 || matches!(error, PolyfillError::Api { .. })
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_create_market_order_uses_caller_supplied_price_skips_book() {
+        let mut server = mockito::Server::new_async().await;
+
+        // resolve_tick_size still calls /tick-size to validate the caller's
+        // tick is >= min_tick_size, even when options.tick_size is Some.
+        let _tick_mock = server
+            .mock("GET", "/tick-size")
+            .match_query(Matcher::UrlEncoded("token_id".into(), "1".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"minimum_tick_size": "0.01"}"#)
+            .create_async()
+            .await;
+
+        // /book mock that MUST NOT be hit. mockito's default expected count
+        // is "at least one", so we use .expect(0) to assert it isn't called.
+        let book_mock = server
+            .mock("GET", "/book")
+            .expect(0)
+            .with_status(200)
+            .with_body(r#"{"market":"0x123","asset_id":"0x123","timestamp":1,"hash":"","bids":[],"asks":[],"min_order_size":"1","neg_risk":false,"tick_size":"0.01","last_trade_price":null}"#)
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_auth(&server.url());
+
+        let args = crate::types::MarketOrderArgs {
+            token_id: "1".to_string(),
+            side: Side::BUY,
+            amount: Decimal::from_str("100").unwrap(),
+            price: Some(Decimal::from_str("0.50").unwrap()),
+            ..Default::default()
+        };
+        let options = crate::types::OrderOptions {
+            tick_size: Some(Decimal::from_str("0.01").unwrap()),
+            neg_risk: Some(false),
+            fee_rate_bps: None,
+        };
+
+        let result = client
+            .create_market_order(&args, None, Some(&options))
+            .await;
+        assert!(
+            result.is_ok(),
+            "expected create_market_order to succeed: {:?}",
+            result.err()
+        );
+
+        // The /book endpoint must not have been hit.
+        book_mock.assert_async().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_create_market_order_none_price_falls_back_to_book() {
+        let mut server = mockito::Server::new_async().await;
+
+        // resolve_tick_size still calls /tick-size to validate caller's tick.
+        let _tick_mock = server
+            .mock("GET", "/tick-size")
+            .match_query(Matcher::UrlEncoded("token_id".into(), "1".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"minimum_tick_size": "0.01"}"#)
+            .create_async()
+            .await;
+
+        // /book returns one ask big enough to cover the $5 buy.
+        let book_mock = server
+            .mock("GET", "/book")
+            .match_query(Matcher::UrlEncoded("token_id".into(), "1".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"market":"0x123","asset_id":"1","timestamp":1,"hash":"","bids":[],"asks":[{"price":"0.50","size":"100"}],"min_order_size":"1","neg_risk":false,"tick_size":"0.01","last_trade_price":null}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_auth(&server.url());
+
+        let args = crate::types::MarketOrderArgs {
+            token_id: "1".to_string(),
+            side: Side::BUY,
+            amount: Decimal::from_str("5").unwrap(),
+            price: None,
+            ..Default::default()
+        };
+        let options = crate::types::OrderOptions {
+            tick_size: Some(Decimal::from_str("0.01").unwrap()),
+            neg_risk: Some(false),
+            fee_rate_bps: None,
+        };
+
+        let result = client
+            .create_market_order(&args, None, Some(&options))
+            .await;
+        assert!(
+            result.is_ok(),
+            "expected create_market_order to succeed: {:?}",
+            result.err()
+        );
+
+        // The /book endpoint must have been hit.
+        book_mock.assert_async().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_create_and_post_market_order_uses_order_type_from_args() {
+        let mut server = mockito::Server::new_async().await;
+
+        // resolve_tick_size still calls /tick-size to validate caller's tick.
+        let _tick_mock = server
+            .mock("GET", "/tick-size")
+            .match_query(Matcher::UrlEncoded("token_id".into(), "1".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"minimum_tick_size": "0.01"}"#)
+            .create_async()
+            .await;
+
+        // /order POST must carry orderType=FAK from the args struct.
+        let order_mock = server
+            .mock("POST", "/order")
+            .match_body(Matcher::Regex(r#""orderType":"FAK""#.to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"orderID":"a"}"#)
+            .create_async()
+            .await;
+
+        let client = create_test_client_with_l2_auth(&server.url());
+
+        let args = crate::types::MarketOrderArgs {
+            token_id: "1".to_string(),
+            side: Side::BUY,
+            amount: Decimal::from_str("100").unwrap(),
+            price: Some(Decimal::from_str("0.50").unwrap()),
+            order_type: crate::types::OrderType::FAK,
+        };
+        let options = crate::types::OrderOptions {
+            tick_size: Some(Decimal::from_str("0.01").unwrap()),
+            neg_risk: Some(false),
+            fee_rate_bps: None,
+        };
+
+        let result = client
+            .create_and_post_market_order(&args, None, Some(&options))
+            .await;
+        assert!(
+            result.is_ok(),
+            "expected create_and_post_market_order to succeed: {:?}",
+            result.err()
+        );
+
+        order_mock.assert_async().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
