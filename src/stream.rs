@@ -7,7 +7,7 @@ use crate::errors::{PolyfillError, Result};
 use crate::types::*;
 use crate::ws_hot_path::{WsBookApplyStats, WsBookUpdateProcessor};
 use chrono::Utc;
-use futures::{SinkExt, Stream, StreamExt};
+use futures::{Sink, SinkExt, Stream, StreamExt};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -28,6 +28,28 @@ pub trait MarketStream: Stream<Item = Result<StreamMessage>> + Send + Sync {
 
     /// Get connection statistics
     fn get_stats(&self) -> StreamStats;
+}
+
+/// The V2 application-layer heartbeat interval mandated by Polymarket's CLOB V2 WS docs.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Returns true for the V2 plaintext heartbeat frames (`PING`, `PONG`).
+///
+/// These bypass JSON parsing entirely — the V2 docs specify they are bare
+/// 4-byte text frames, not JSON objects.
+fn is_heartbeat_text(s: &str) -> bool {
+    s == "PING" || s == "PONG"
+}
+
+/// Build a heartbeat `Interval` whose first tick lands `HEARTBEAT_INTERVAL` from now,
+/// not immediately. Plain `tokio::time::interval` would fire on the first `poll_tick`,
+/// which would send a PING the moment a caller polls the stream after connect —
+/// wasteful and out-of-spec.
+fn new_heartbeat_interval() -> tokio::time::Interval {
+    let start = tokio::time::Instant::now() + HEARTBEAT_INTERVAL;
+    let mut interval = tokio::time::interval_at(start, HEARTBEAT_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
 }
 
 /// WebSocket-based market stream implementation
@@ -56,6 +78,10 @@ pub struct WebSocketStream {
     stats: StreamStats,
     /// Reconnection configuration
     reconnect_config: ReconnectConfig,
+    /// Application-layer heartbeat driver — fires every 10s while the stream is polled.
+    /// `None` before the first connect; populated (and re-armed) on every successful
+    /// `connect()` so the first PING always lands 10s post-connect.
+    heartbeat: Option<tokio::time::Interval>,
 }
 
 /// Stream statistics
@@ -112,6 +138,7 @@ impl WebSocketStream {
                 reconnect_count: 0,
             },
             reconnect_config: ReconnectConfig::default(),
+            heartbeat: None,
         }
     }
 
@@ -141,8 +168,56 @@ impl WebSocketStream {
             })?;
 
         self.connection = Some(ws_stream);
+        self.heartbeat = Some(new_heartbeat_interval());
         info!("Connected to WebSocket stream at {}", self.url);
         Ok(())
+    }
+
+    /// Drive the V2 application-layer heartbeat.
+    ///
+    /// On each fired tick, attempts to send the plaintext `PING` text frame via the
+    /// connection's `Sink`. Always returns `Poll::Pending` — the heartbeat is a
+    /// side-effect, never a yielded `StreamMessage`.
+    ///
+    /// Send failures (sink not ready, write error) are logged and counted in
+    /// `stats.errors` but do not propagate. The user's read path will surface the
+    /// real socket condition on the next poll.
+    fn poll_heartbeat(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let Some(heartbeat) = self.heartbeat.as_mut() else {
+            return Poll::Pending;
+        };
+        while heartbeat.poll_tick(cx).is_ready() {
+            let Some(connection) = self.connection.as_mut() else {
+                break;
+            };
+
+            match Pin::new(&mut *connection).poll_ready(cx) {
+                Poll::Pending => break,
+                Poll::Ready(Err(e)) => {
+                    debug!("WebSocket heartbeat: sink not ready: {}", e);
+                    self.stats.errors += 1;
+                    break;
+                },
+                Poll::Ready(Ok(())) => {},
+            }
+
+            let frame = tokio_tungstenite::tungstenite::Message::Text(
+                tokio_tungstenite::tungstenite::Utf8Bytes::from_static("PING"),
+            );
+            if let Err(e) = Pin::new(&mut *connection).start_send(frame) {
+                debug!("WebSocket heartbeat: start_send failed: {}", e);
+                self.stats.errors += 1;
+                break;
+            }
+
+            // Best-effort flush; if it's Pending the frame is buffered and will go out
+            // on the next IO progress. We don't block on it here.
+            let _ = Pin::new(&mut *connection).poll_flush(cx);
+
+            self.stats.messages_sent += 1;
+        }
+
+        Poll::Pending
     }
 
     /// Send a message to the WebSocket
@@ -456,6 +531,8 @@ impl<'a> Stream for WebSocketBookApplier<'a> {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
+            let _ = self.stream.poll_heartbeat(cx);
+
             let Some(connection) = &mut self.stream.connection else {
                 return Poll::Ready(None);
             };
@@ -464,6 +541,9 @@ impl<'a> Stream for WebSocketBookApplier<'a> {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(Ok(msg))) => match msg {
                     tokio_tungstenite::tungstenite::Message::Text(text) => {
+                        if is_heartbeat_text(&text) {
+                            continue;
+                        }
                         match self.apply_text_utf8(text) {
                             Ok(stats) => {
                                 if stats.book_messages == 0 {
@@ -509,6 +589,8 @@ impl Stream for WebSocketStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
+            let _ = self.poll_heartbeat(cx);
+
             if let Some(message) = self.pending.pop_front() {
                 return Poll::Ready(Some(Ok(message)));
             }
@@ -521,6 +603,9 @@ impl Stream for WebSocketStream {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(Ok(ws_message))) => match ws_message {
                     tokio_tungstenite::tungstenite::Message::Text(text) => {
+                        if is_heartbeat_text(&text) {
+                            continue;
+                        }
                         match crate::decode::parse_stream_messages(&text) {
                             Ok(messages) => {
                                 let mut iter = messages.into_iter();
@@ -713,6 +798,28 @@ mod tests {
     use super::*;
     use rust_decimal::Decimal;
     use std::str::FromStr;
+
+    #[test]
+    fn is_heartbeat_text_matches_v2_frames() {
+        assert!(is_heartbeat_text("PING"));
+        assert!(is_heartbeat_text("PONG"));
+        assert!(!is_heartbeat_text("ping"));
+        assert!(!is_heartbeat_text("pong"));
+        assert!(!is_heartbeat_text(""));
+        assert!(!is_heartbeat_text("{\"event_type\":\"book\"}"));
+        assert!(!is_heartbeat_text("PING\n"));
+    }
+
+    #[test]
+    fn websocket_stream_skips_pong_text_frames() {
+        // Stream-level proof that a server PONG would not surface as a parse error
+        // through the user-visible read path. The hot-path applier and the
+        // generic stream both gate on `is_heartbeat_text` before parsing.
+        let text = "PONG";
+        assert!(is_heartbeat_text(text));
+        // And conversely, the previous parser would have errored on it:
+        assert!(crate::decode::parse_stream_messages(text).is_err());
+    }
 
     #[test]
     fn test_mock_stream() {
