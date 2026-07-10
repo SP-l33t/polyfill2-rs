@@ -30,8 +30,10 @@ pub trait MarketStream: Stream<Item = Result<StreamMessage>> + Send + Sync {
     fn get_stats(&self) -> StreamStats;
 }
 
-/// The V2 application-layer heartbeat interval mandated by Polymarket's CLOB V2 WS docs.
-const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// The V2 application-layer heartbeat interval. Polymarket drops connections
+/// after ~10s without a client `PING`, so send at half the deadline — a 10s
+/// cadence races the 10s timeout with zero margin and loses on any jitter.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Returns true for the V2 plaintext heartbeat frames (`PING`, `PONG`).
 ///
@@ -78,10 +80,19 @@ pub struct WebSocketStream {
     stats: StreamStats,
     /// Reconnection configuration
     reconnect_config: ReconnectConfig,
-    /// Application-layer heartbeat driver — fires every 10s while the stream is polled.
-    /// `None` before the first connect; populated (and re-armed) on every successful
-    /// `connect()` so the first PING always lands 10s post-connect.
+    /// Application-layer heartbeat driver — fires every `HEARTBEAT_INTERVAL` while
+    /// the stream is polled. `None` before the first connect; populated (and
+    /// re-armed) on every successful `connect()` so the first PING always lands
+    /// one interval post-connect.
     heartbeat: Option<tokio::time::Interval>,
+    /// A heartbeat tick fired but the PING frame could not be queued yet (sink
+    /// busy). Retried on every poll — waiting for the next tick instead would
+    /// double the effective PING gap and blow the server's ~10s deadline.
+    ping_due: bool,
+    /// A queued PING has not been flushed to the socket yet. tungstenite's read
+    /// path only auto-flushes protocol replies (pong/close), never user-queued
+    /// frames, so flush must be re-polled here until it completes.
+    flush_pending: bool,
 }
 
 /// Stream statistics
@@ -139,6 +150,8 @@ impl WebSocketStream {
             },
             reconnect_config: ReconnectConfig::default(),
             heartbeat: None,
+            ping_due: false,
+            flush_pending: false,
         }
     }
 
@@ -169,34 +182,46 @@ impl WebSocketStream {
 
         self.connection = Some(ws_stream);
         self.heartbeat = Some(new_heartbeat_interval());
+        self.ping_due = false;
+        self.flush_pending = false;
         info!("Connected to WebSocket stream at {}", self.url);
         Ok(())
     }
 
     /// Drive the V2 application-layer heartbeat.
     ///
-    /// On each fired tick, attempts to send the plaintext `PING` text frame via the
-    /// connection's `Sink`. Always returns `Poll::Pending` — the heartbeat is a
-    /// side-effect, never a yielded `StreamMessage`.
+    /// Fired ticks mark a PING as due; queueing and flushing are then retried on
+    /// EVERY poll until each completes, not just on tick boundaries. Consuming a
+    /// tick and dropping its PING (or leaving it unflushed until the next tick)
+    /// stretches the effective PING gap past the server's ~10s deadline, which
+    /// resets the connection without a closing handshake.
     ///
-    /// Send failures (sink not ready, write error) are logged and counted in
-    /// `stats.errors` but do not propagate. The user's read path will surface the
-    /// real socket condition on the next poll.
+    /// Always returns `Poll::Pending` — the heartbeat is a side-effect, never a
+    /// yielded `StreamMessage`. Write errors are logged and counted in
+    /// `stats.errors` but do not propagate; the read path surfaces the real
+    /// socket condition on the next poll.
     fn poll_heartbeat(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         let Some(heartbeat) = self.heartbeat.as_mut() else {
             return Poll::Pending;
         };
+        // Collapse any number of fired ticks into a single due PING.
         while heartbeat.poll_tick(cx).is_ready() {
+            self.ping_due = true;
+        }
+
+        if self.ping_due {
             let Some(connection) = self.connection.as_mut() else {
-                break;
+                return Poll::Pending;
             };
 
             match Pin::new(&mut *connection).poll_ready(cx) {
-                Poll::Pending => break,
+                // Sink busy — PING stays due; poll_ready registered the write
+                // waker, so the task re-wakes when the socket drains.
+                Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => {
                     debug!("WebSocket heartbeat: sink not ready: {}", e);
                     self.stats.errors += 1;
-                    break;
+                    return Poll::Pending;
                 },
                 Poll::Ready(Ok(())) => {},
             }
@@ -207,14 +232,28 @@ impl WebSocketStream {
             if let Err(e) = Pin::new(&mut *connection).start_send(frame) {
                 debug!("WebSocket heartbeat: start_send failed: {}", e);
                 self.stats.errors += 1;
-                break;
+                return Poll::Pending;
             }
-
-            // Best-effort flush; if it's Pending the frame is buffered and will go out
-            // on the next IO progress. We don't block on it here.
-            let _ = Pin::new(&mut *connection).poll_flush(cx);
-
+            self.ping_due = false;
+            self.flush_pending = true;
             self.stats.messages_sent += 1;
+        }
+
+        if self.flush_pending {
+            let Some(connection) = self.connection.as_mut() else {
+                return Poll::Pending;
+            };
+            match Pin::new(&mut *connection).poll_flush(cx) {
+                Poll::Ready(Ok(())) => self.flush_pending = false,
+                Poll::Ready(Err(e)) => {
+                    debug!("WebSocket heartbeat: flush failed: {}", e);
+                    self.stats.errors += 1;
+                    // Drop the flag — the read path reports the broken socket.
+                    self.flush_pending = false;
+                },
+                // Write waker registered — retried on the next wake.
+                Poll::Pending => {},
+            }
         }
 
         Poll::Pending
