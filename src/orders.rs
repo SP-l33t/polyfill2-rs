@@ -10,8 +10,9 @@ use crate::types::{
     ExtraOrderArgs, ExtraOrderArgsV1, MarketOrderArgs, OrderOptions, OrderType,
     RfqOrderExecutionRequest, Side, SignedOrderRequest,
 };
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 use alloy_signer_local::PrivateKeySigner;
+use alloy_sol_types::{eip712_domain, SolStruct};
 use rand::RngExt;
 use rust_decimal::Decimal;
 use rust_decimal::RoundingStrategy::{AwayFromZero, MidpointTowardZero, ToZero};
@@ -143,6 +144,63 @@ pub fn get_contract_config(chain_id: u64, neg_risk: bool) -> Option<ContractConf
         }),
         _ => None,
     }
+}
+
+/// Compute the deterministic CLOB V2 order ID before submission.
+///
+/// The ID is the EIP-712 signing hash used by the selected exchange contract.
+/// Reposting the exact same [`SignedOrderRequest`] therefore addresses the same
+/// logical order and can be handled idempotently by callers.
+pub fn signed_order_id(
+    order: &SignedOrderRequest,
+    chain_id: u64,
+    neg_risk: bool,
+) -> Result<String> {
+    let contract = get_contract_config(chain_id, neg_risk).ok_or_else(|| {
+        PolyfillError::config(format!(
+            "Unsupported chain ID {chain_id} for CLOB V2 order hashing"
+        ))
+    })?;
+    let exchange = Address::from_str(&contract.exchange)
+        .map_err(|e| PolyfillError::validation(format!("Invalid exchange address: {e}")))?;
+    let side = match order.side.as_str() {
+        "BUY" => Side::BUY as u8,
+        "SELL" => Side::SELL as u8,
+        other => {
+            return Err(PolyfillError::validation(format!(
+                "Invalid signed order side: {other}"
+            )));
+        },
+    };
+    let parse_u256 = |field: &str, value: &str| {
+        U256::from_str_radix(value, 10)
+            .map_err(|e| PolyfillError::validation(format!("Invalid signed order {field}: {e}")))
+    };
+
+    let wire_order = crate::auth::Order {
+        salt: U256::from(order.salt),
+        maker: Address::from_str(&order.maker)
+            .map_err(|e| PolyfillError::validation(format!("Invalid order maker: {e}")))?,
+        signer: Address::from_str(&order.signer)
+            .map_err(|e| PolyfillError::validation(format!("Invalid order signer: {e}")))?,
+        tokenId: parse_u256("token_id", &order.token_id)?,
+        makerAmount: parse_u256("maker_amount", &order.maker_amount)?,
+        takerAmount: parse_u256("taker_amount", &order.taker_amount)?,
+        side,
+        signatureType: order.signature_type,
+        timestamp: parse_u256("timestamp", &order.timestamp)?,
+        metadata: B256::from_str(&order.metadata)
+            .map_err(|e| PolyfillError::validation(format!("Invalid order metadata: {e}")))?,
+        builder: B256::from_str(&order.builder)
+            .map_err(|e| PolyfillError::validation(format!("Invalid order builder: {e}")))?,
+    };
+    let domain = eip712_domain!(
+        name: "Polymarket CTF Exchange",
+        version: "2",
+        chain_id: chain_id,
+        verifying_contract: exchange,
+    );
+    Ok(format!("{:#x}", wire_order.eip712_signing_hash(&domain)))
 }
 
 /// Generate a random seed for order salt
@@ -596,6 +654,35 @@ mod tests {
         // Test unsupported chain
         let config_unsupported = get_contract_config(999, false);
         assert!(config_unsupported.is_none());
+    }
+
+    #[test]
+    fn signed_order_id_matches_v2_reference_fixture() {
+        let order = SignedOrderRequest {
+            salt: 479_249_096_354,
+            maker: "0x1111111111111111111111111111111111111111".to_string(),
+            signer: "0x1111111111111111111111111111111111111111".to_string(),
+            taker: "0x0000000000000000000000000000000000000000".to_string(),
+            token_id: "1234".to_string(),
+            maker_amount: "100000000".to_string(),
+            taker_amount: "50000000".to_string(),
+            side: "BUY".to_string(),
+            signature_type: 3,
+            timestamp: "1710000000000".to_string(),
+            expiration: "0".to_string(),
+            metadata: format!("{:#x}", B256::ZERO),
+            builder: format!("{:#x}", B256::ZERO),
+            signature: "0x00".to_string(),
+        };
+
+        assert_eq!(
+            signed_order_id(&order, 137, false).unwrap(),
+            "0xc4d204bd50748c59f3c81495bf908694fe8a185b431e1057621c3a9bbea7661b"
+        );
+        assert_ne!(
+            signed_order_id(&order, 137, false).unwrap(),
+            signed_order_id(&order, 137, true).unwrap()
+        );
     }
 
     #[test]

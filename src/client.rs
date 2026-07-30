@@ -8,7 +8,7 @@ use crate::errors::{PolyfillError, Result};
 use crate::http_config::{
     create_colocated_client, create_internet_client, create_optimized_client, prewarm_connections,
 };
-use crate::types::{OrderOptions, PostOrder, SignedOrderRequest};
+use crate::types::{IdempotentPostOrderOutcome, OrderOptions, PostOrder, SignedOrderRequest};
 use alloy_primitives::{Address, U256};
 use alloy_signer_local::PrivateKeySigner;
 use reqwest::header::HeaderName;
@@ -48,6 +48,50 @@ impl Default for OrderArgs {
             size: Decimal::ZERO,
             side: Side::BUY,
         }
+    }
+}
+
+enum OrderPostAttempt {
+    Response(crate::types::PostOrderResponse),
+    Duplicate(String),
+    Ambiguous(String),
+    Rejected(PolyfillError),
+}
+
+fn order_submission_error_text(error: &PolyfillError) -> String {
+    if matches!(error, PolyfillError::Timeout { .. }) {
+        // reqwest does not expose the configured Client timeout. Avoid
+        // repeating the legacy default duration stored by the From impl.
+        "CLOB HTTP request exceeded its configured timeout".to_string()
+    } else {
+        error.to_string()
+    }
+}
+
+fn classify_order_post(result: Result<crate::types::PostOrderResponse>) -> OrderPostAttempt {
+    match result {
+        Ok(response) => {
+            let duplicate = response
+                .error_msg
+                .as_deref()
+                .is_some_and(|message| message.to_ascii_lowercase().contains("duplicat"));
+            if duplicate {
+                OrderPostAttempt::Duplicate(
+                    response
+                        .error_msg
+                        .unwrap_or_else(|| "duplicate order".to_string()),
+                )
+            } else {
+                OrderPostAttempt::Response(response)
+            }
+        },
+        Err(error) if error.is_duplicate_order() => {
+            OrderPostAttempt::Duplicate(order_submission_error_text(&error))
+        },
+        Err(error) if error.is_ambiguous_order_submission() => {
+            OrderPostAttempt::Ambiguous(order_submission_error_text(&error))
+        },
+        Err(error) => OrderPostAttempt::Rejected(error),
     }
 }
 
@@ -1051,6 +1095,53 @@ impl ClobClient {
         Ok(response.json::<crate::types::PostOrderResponse>().await?)
     }
 
+    /// Post an already-signed order and retry one ambiguous failure without
+    /// changing its deterministic order ID.
+    ///
+    /// A timeout, network failure, response decode failure, or 5xx can occur
+    /// after the CLOB accepted the order. This method retries the exact cloned
+    /// [`SignedOrderRequest`], so an accepted first attempt becomes a duplicate
+    /// instead of a second executable order. Definite rejections are returned
+    /// as [`Err`].
+    pub async fn post_order_idempotent(
+        &self,
+        order: SignedOrderRequest,
+        order_type: OrderType,
+        neg_risk: bool,
+        retry_delay: std::time::Duration,
+    ) -> Result<IdempotentPostOrderOutcome> {
+        let order_id = crate::orders::signed_order_id(&order, self.chain_id, neg_risk)?;
+        let first = classify_order_post(self.post_order(order.clone(), order_type).await);
+
+        match first {
+            OrderPostAttempt::Response(response) => {
+                Ok(IdempotentPostOrderOutcome::Response(response))
+            },
+            OrderPostAttempt::Duplicate(message) => {
+                Ok(IdempotentPostOrderOutcome::Duplicate { order_id, message })
+            },
+            OrderPostAttempt::Rejected(error) => Err(error),
+            OrderPostAttempt::Ambiguous(first_error) => {
+                tokio::time::sleep(retry_delay).await;
+                match classify_order_post(self.post_order(order, order_type).await) {
+                    OrderPostAttempt::Response(response) => {
+                        Ok(IdempotentPostOrderOutcome::Response(response))
+                    },
+                    OrderPostAttempt::Duplicate(message) => {
+                        Ok(IdempotentPostOrderOutcome::Duplicate { order_id, message })
+                    },
+                    OrderPostAttempt::Rejected(error) => Err(error),
+                    OrderPostAttempt::Ambiguous(second_error) => {
+                        Ok(IdempotentPostOrderOutcome::Uncertain {
+                            order_id,
+                            message: format!("first attempt: {first_error}; retry: {second_error}"),
+                        })
+                    },
+                }
+            },
+        }
+    }
+
     /// Post multiple orders to the exchange in a single request
     pub async fn post_orders(
         &self,
@@ -1658,7 +1749,7 @@ impl ClobClient {
             .ok_or_else(|| PolyfillError::config("API credentials not configured"))?;
 
         let method = Method::GET;
-        let endpoint = &format!("/data/order/{}", order_id);
+        let endpoint = &format!("/order/{}", order_id);
         let headers =
             create_l2_headers::<Value>(signer, api_creds, method.as_str(), endpoint, None)?;
 
@@ -1674,6 +1765,19 @@ impl ClobClient {
             .send()
             .await
             .map_err(|e| PolyfillError::network(format!("Request failed: {}", e), e))?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(PolyfillError::api(
+                status,
+                if body.is_empty() {
+                    format!("Failed to get order {order_id}")
+                } else {
+                    format!("Failed to get order {order_id}: {body}")
+                },
+            ));
+        }
 
         response
             .json::<crate::types::OpenOrder>()
@@ -2506,6 +2610,7 @@ mod tests {
     use serde_json::json;
     use std::str::FromStr;
     use tokio;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn create_test_client(base_url: &str) -> ClobClient {
         ClobClient::new(base_url)
@@ -2556,6 +2661,104 @@ mod tests {
                 .to_string(),
             signature: "0xdeadbeef".to_string(),
         }
+    }
+
+    async fn read_http_request_body(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = socket.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "connection closed before request completed");
+            request.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            let body_start = header_end + 4;
+            if request.len() >= body_start + content_length {
+                return request[body_start..body_start + content_length].to_vec();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idempotent_post_retries_the_exact_signed_payload() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let responses = [
+                ("503 Service Unavailable", r#"{"error":"temporary"}"#),
+                (
+                    "400 Bad Request",
+                    r#"{"error":"order 0xabc is invalid. Duplicated."}"#,
+                ),
+            ];
+            let mut bodies = Vec::new();
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                bodies.push(read_http_request_body(&mut socket).await);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+
+        let client = create_test_client_with_l2_auth(&format!("http://{address}"));
+        let order = sample_signed_order();
+        let expected_id = crate::orders::signed_order_id(&order, 137, false).unwrap();
+        let outcome = client
+            .post_order_idempotent(
+                order,
+                crate::types::OrderType::FAK,
+                false,
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+
+        match outcome {
+            crate::types::IdempotentPostOrderOutcome::Duplicate { order_id, .. } => {
+                assert_eq!(order_id, expected_id);
+            },
+            other => panic!("expected duplicate after exact retry, got {other:?}"),
+        }
+        let bodies = server.await.unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(
+            bodies[0], bodies[1],
+            "retry payload was re-signed or changed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_order_uses_current_endpoint_and_preserves_http_status() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/order/0xmissing")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"order not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = create_test_client_with_l2_auth(&server.url());
+
+        let error = client.get_order("0xmissing").await.unwrap_err();
+
+        mock.assert_async().await;
+        assert!(matches!(error, PolyfillError::Api { status: 404, .. }));
     }
 
     #[tokio::test(flavor = "multi_thread")]

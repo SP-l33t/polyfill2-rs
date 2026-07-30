@@ -142,6 +142,31 @@ pub enum StreamErrorKind {
 }
 
 impl PolyfillError {
+    /// Whether an order POST may have reached the CLOB despite the error.
+    ///
+    /// Retrying these errors is safe only when the exact same signed payload
+    /// is reused. A freshly signed order would have a different order hash and
+    /// could execute twice.
+    pub fn is_ambiguous_order_submission(&self) -> bool {
+        match self {
+            PolyfillError::Timeout { .. }
+            | PolyfillError::Network { .. }
+            | PolyfillError::Parse { .. }
+            | PolyfillError::Internal { .. } => true,
+            PolyfillError::Api { status, .. } => (500..600).contains(status),
+            _ => false,
+        }
+    }
+
+    /// Whether the CLOB reports that the same signed order already exists.
+    pub fn is_duplicate_order(&self) -> bool {
+        match self {
+            PolyfillError::Order { kind, .. } => matches!(kind, OrderErrorKind::DuplicateOrder),
+            PolyfillError::Api { message, .. } => message.to_ascii_lowercase().contains("duplicat"),
+            _ => false,
+        }
+    }
+
     /// Check if this error is retryable
     pub fn is_retryable(&self) -> bool {
         match self {

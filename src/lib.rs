@@ -104,6 +104,7 @@ pub use crate::types::{
     ExtraOrderArgsV1,
     FeeRateResponse,
     FillEvent,
+    IdempotentPostOrderOutcome,
     MakerOrder,
     Market,
     MarketSnapshot,
@@ -164,7 +165,9 @@ pub use crate::types::{
 pub use crate::client::{ClobClient, PolyfillClient};
 
 // Re-export order signing types (for proxy wallet support)
-pub use crate::orders::{get_contract_config, get_v1_contract_config, OrderBuilder, SigType};
+pub use crate::orders::{
+    get_contract_config, get_v1_contract_config, signed_order_id, OrderBuilder, SigType,
+};
 pub use alloy_primitives::Address;
 
 // Re-export compatibility types (for easy migration from polymarket-rs-client)

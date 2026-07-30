@@ -1298,6 +1298,29 @@ pub struct PostOrderResponse {
     pub trade_ids: Vec<String>,
 }
 
+/// Result of posting an already-signed order with idempotent retry semantics.
+#[derive(Debug, Clone)]
+pub enum IdempotentPostOrderOutcome {
+    /// The CLOB returned a structured response. Inspect `success` and
+    /// `error_msg` exactly as with [`PostOrderResponse`].
+    Response(PostOrderResponse),
+    /// The exact signed order was already accepted by an earlier attempt.
+    Duplicate {
+        /// Deterministic EIP-712 order hash.
+        order_id: String,
+        /// CLOB error text that identified the duplicate.
+        message: String,
+    },
+    /// Both attempts had ambiguous transport/server outcomes. The order may
+    /// exist, so callers must keep tracking `order_id` and must not re-sign.
+    Uncertain {
+        /// Deterministic EIP-712 order hash.
+        order_id: String,
+        /// Last ambiguous error, with any prior error included for context.
+        message: String,
+    },
+}
+
 /// Response from cancel endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
